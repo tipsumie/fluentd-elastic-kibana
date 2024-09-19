@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: logs
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.16-debian-elasticsearch7-arm64-2
+        resources:
+          requests:
+            memory: "200Mi"
+            cpu: "150m"
+          limits:
+            memory: "400Mi"
+            cpu: "300m"
+        env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: FLUENT_ELASTICSEARCH_HOST
+          value: "elasticsearch"
+        - name: FLUENT_ELASTICSEARCH_PORT
+          value: "9200"
+        - name: FLUENTD_LOG_FORMAT   
+          value: "json"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /fluentd/etc
+        - name: varlog 
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: fluentd-config
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: logs
+  labels:
+    app: fluentd
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      <parse>
+        @type json
+      </parse>
+    </source>
+
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+    </filter>
+    
+    # Filter to exclude Kibana and Elasticsearch logs
+    <filter kubernetes.**>
+      @type grep
+      <exclude>
+        key $.kubernetes.container_name
+        pattern /kibana|coredns|elasticsearch|fluentd/
+      </exclude>
+    </filter>
+
+    # Filter to exclude kube-system logs
+    <filter kubernetes.**>
+      @type grep
+      <exclude>
+        key $.kubernetes.namespace_name
+        pattern /kube-system/
+      </exclude>
+    </filter>
+
+    # Transfrom json data
+    <filter kubernetes.**>
+      @type parser
+      key_name log
+      format json
+      reserve_data true  # Keep the original fields
+    </filter>
+
+    <filter kubernetes.**>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        log_type ${record.has_key?('logType')? 'request' : 'application'}
+      </record>
+    </filter>
+
+    # Your existing filter for additional transformations
+    <filter kubernetes.**>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        @timestamp ${record['timestamp'] || Time.now.strftime('%Y-%m-%dT%H:%M:%S.%N%:z')}
+        correlationId ${record['correlationId']}
+        level ${record['level'] || 'INFO'}
+        message ${record['message'] || 'No message'}
+        logger ${record['logger_name']}
+        thread ${record['thread_name']}
+        uri ${record['uri']}
+        method ${record['method']}
+        responseStatus ${record['status']}
+        headers ${record['headers']}
+        requestBody ${record['requestBody']}
+        responseBody ${record['responseBody']}
+        timeTaken ${record['timeTaken'] ? record['timeTaken'].to_f : 0.0}
+      </record>
+    </filter>
+
+    # Use rewrite_tag_filter to set tags based on log_type
+    <match kubernetes.**>
+      @type rewrite_tag_filter
+      <rule>
+        key log_type
+        pattern ^request$
+        tag elasticsearch.request
+      </rule>
+      <rule>
+        key log_type
+        pattern ^application$
+        tag elasticsearch.application
+      </rule>
+    </match>
+
+    # Elasticsearch output for request logs
+    <match elasticsearch.request>
+      @type elasticsearch
+      @id elasticsearch_request
+      host "#{ENV['FLUENT_ELASTICSEARCH_HOST']}"
+      port "#{ENV['FLUENT_ELASTICSEARCH_PORT']}"
+      logstash_format true
+      logstash_prefix request
+      logstash_dateformat %Y-%m-%d
+      include_timestamp true
+      time_key @timestamp
+      time_key_format %Y-%m-%dT%H:%M:%S.%N%:z
+      include_tag_key true
+      type_name log_event
+      flush_interval 5s
+    </match>
+
+    # Elasticsearch output for application logs
+    <match elasticsearch.application>
+      @type elasticsearch
+      @id elasticsearch_application
+      host "#{ENV['FLUENT_ELASTICSEARCH_HOST']}"
+      port "#{ENV['FLUENT_ELASTICSEARCH_PORT']}"
+      logstash_format true
+      logstash_prefix application
+      logstash_dateformat %Y-%m-%d
+      include_timestamp true
+      time_key @timestamp
+      time_key_format %Y-%m-%dT%H:%M:%S.%N%:z
+      include_tag_key true
+      type_name log_event
+      flush_interval 5s
+    </match>
